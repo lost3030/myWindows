@@ -1,0 +1,56 @@
+{
+  "name": "desktop-widgets",
+  "version": "1.0.0",
+  "description": "精美桌面自定义悬浮组件 - Beautiful Customizable Desktop Widgets",
+  "license": "MIT",
+  "author": "Desktop Widgets contributors",
+  "main": "main.js",
+  "scripts": {
+    "dev": "concurrently -n vite,electron -c blue,green \"vite\" \"wait-on tcp:5173 && electron .\"",
+    "dev:vite": "vite",
+    "dev:electron": "electron .",
+    "build": "vite build",
+    "package": "vite build && electron-builder --win",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "@vitejs/plugin-react": "^4.4.1",
+    "concurrently": "^9.1.2",
+    "electron": "^35.1.2",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.2",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.desktop.widgets",
+    "productName": "Desktop Widgets",
+    "copyright": "Copyright © 2026 Desktop Widgets",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "main.js",
+      "preload.js"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "桌面组件",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true
+    }
+  }
+}
