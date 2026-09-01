@@ -14,6 +14,8 @@ export interface StockSearchResult {
 }
 
 export interface StockData extends StockInfo {
+  /** 这条报价实际来自哪个数据源(东财 / Yahoo / 腾讯 / 新浪),显示在组件底部 */
+  source?: string;
   price: number;
   changePercent: number;
   changeAmount: number;

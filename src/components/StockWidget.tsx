@@ -22,7 +22,10 @@ const MARKET_SHORT: Record<string, string> = {
 function formatPrice(price: number | null | undefined, market: string): string {
   if (price == null || price === 0) return '--'
   const prefix = CURRENCY[market] ?? ''
-  return `${prefix}${price.toFixed(2)}`
+  // 债券收益率、低价 ETF 这类小数值,两位小数会把基点级别的变动整个抹平
+  // (30 年期收益率一整天都显示 5.32),所以按量级分档给小数位。
+  const digits = Math.abs(price) < 10 ? 3 : 2
+  return `${prefix}${price.toFixed(digits)}`
 }
 
 function formatChange(val: number | null | undefined): string {
@@ -36,12 +39,26 @@ function timeToMinutes(t: string): number {
   return parseInt(m[1]) * 60 + parseInt(m[2])
 }
 
+// 判断"这里是不是休市断点"的阈值必须跟着实际采样间隔走。分时序列被降采样后,
+// 相邻两点可能相隔 6-9 分钟;如果还拿写死的 5 分钟当阈值,就会把每一个点都判成
+// 独立线段,段间距吃光画布宽度,整条线直接消失(2026-08-20 布伦特原油实测)。
 function detectSegments(times: string[]) {
   const segs: { start: number; end: number }[] = []
+  if (times.length === 0) return segs
+
+  const gaps: number[] = []
+  for (let i = 1; i < times.length; i++) {
+    const d = timeToMinutes(times[i]) - timeToMinutes(times[i - 1])
+    if (d > 0) gaps.push(d)
+  }
+  gaps.sort((a, b) => a - b)
+  const median = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 1
+  const threshold = Math.max(5, median * 3)
+
   let start = 0
   for (let i = 1; i < times.length; i++) {
     const diff = timeToMinutes(times[i]) - timeToMinutes(times[i - 1])
-    if (diff > 5 || diff < -5) {
+    if (diff > threshold || diff < -threshold) {
       segs.push({ start, end: i - 1 })
       start = i
     }
@@ -71,9 +88,12 @@ const Sparkline = memo(function Sparkline({ prices, times, preClose, isUp, isFla
   const W = 86
   const H = 34
   const PAD = 1
-  const GAP = 3
 
   const segments = detectSegments(times)
+  // 段间距总和封顶在画布宽度的 1/4,兜住"分段数意外爆炸"的情况——
+  // 哪怕阈值再判错,折线也至少还有 3/4 的宽度可画,不会整条消失。
+  const maxGapTotal = (W - PAD * 2) * 0.25
+  const GAP = segments.length > 1 ? Math.min(3, maxGapTotal / (segments.length - 1)) : 0
   const gapTotal = GAP * Math.max(0, segments.length - 1)
   const usable = W - PAD * 2 - gapTotal
   const total = prices.length
@@ -152,6 +172,7 @@ export default function StockWidget({ config, id }: { config: StockConfig | null
   const [loading, setLoading] = useState(true)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
   const [error, setError] = useState(false)
+  const [now, setNow] = useState(() => Date.now())
   const [localOrder, setLocalOrder] = useState<StockInfo[] | null>(null)
   const [drag, setDrag] = useState<DragState | null>(null)
   const timerRef = useRef<ReturnType<typeof setInterval>>(undefined)
@@ -204,6 +225,18 @@ export default function StockWidget({ config, id }: { config: StockConfig | null
   useEffect(() => {
     setLocalOrder(null)
   }, [config?.stocks])
+
+  // 取数失败时组件根本不会重渲染,光靠 lastUpdate 发现不了"行情已经停住了",
+  // 所以这里自己起一个 5 秒心跳来推进时间判断。
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 5000)
+    return () => clearInterval(id)
+  }, [])
+
+  const staleAfterMs = Math.max((config?.refreshInterval || 5000) * 3, 60000)
+  const isStale = lastUpdate != null && now - lastUpdate.getTime() > staleAfterMs
+  const sources = Array.from(new Set(stockData.map((d) => d.source).filter(Boolean)))
+  const allSourcesDead = !loading && stocks.length > 0 && stockData.length === 0
 
   function getStockData(s: StockInfo): StockData | undefined {
     return stockData.find((d) => d.code === s.code && d.market === s.market)
@@ -281,7 +314,10 @@ export default function StockWidget({ config, id }: { config: StockConfig | null
         </div>
       </div>
 
-      <div className="stock-list" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+      <div
+        className={`stock-list${isStale ? ' is-stale' : ''}`}
+        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+      >
         {loading && (
           <div className="stock-skeleton-list">
             {Array.from({ length: 4 }).map((_, i) => (
@@ -299,6 +335,13 @@ export default function StockWidget({ config, id }: { config: StockConfig | null
             <button className="stock-empty-btn" type="button" onClick={() => void window.electronAPI.openSettings()}>
               前往设置
             </button>
+          </div>
+        )}
+
+        {allSourcesDead && (
+          <div className="stock-empty">
+            <div className="stock-empty-icon">📡</div>
+            <div className="stock-empty-text">所有数据源都取不到行情</div>
           </div>
         )}
 
@@ -365,12 +408,16 @@ export default function StockWidget({ config, id }: { config: StockConfig | null
       </div>
 
       <div className="stock-footer">
-        {error && <span className="stock-offline">⚠ 离线</span>}
-        {lastUpdate && (
+        {isStale && lastUpdate ? (
+          <span className="stock-stale-warn">
+            ⚠ 行情已停滞 · 最后更新 {lastUpdate.toLocaleTimeString('zh-CN')}
+          </span>
+        ) : lastUpdate ? (
           <span className="stock-update-time">
             更新于 {lastUpdate.toLocaleTimeString('zh-CN')}
+            {sources.length > 0 && <span className="stock-source"> · {sources.join('/')}</span>}
           </span>
-        )}
+        ) : null}
       </div>
     </div>
   )

@@ -1188,3 +1188,25 @@ html, body {
 .bg-card-info { display: flex; flex-direction: column; gap: 2px; }
 .bg-card-label { font-size: 12px; font-weight: 600; }
 .bg-card-desc { font-size: 10px; color: var(--text-muted); }
+
+
+/* ── 行情停滞提示(数据源全挂时,不能让旧价格看起来像新的)────────────────── */
+.stock-list.is-stale .stock-price-area {
+  opacity: 0.4;
+  filter: grayscale(1);
+}
+
+.stock-list.is-stale .stock-chart-area {
+  opacity: 0.35;
+}
+
+.stock-stale-warn {
+  font-size: 11px;
+  color: #f59e0b;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+.stock-source {
+  opacity: 0.6;
+}

@@ -23,7 +23,15 @@ export default function ClockWidget({ config }: { config: ClockConfig | null }) 
 
   useEffect(() => {
     if (cfg.showMilliseconds) {
-      const loop = () => {
+      // 毫秒指针原本每一帧都写一次 CSS transform,而这是个透明置顶窗口,
+      // 每写一次就要重新合成一次整窗,实测把 GPU 进程拉到 30% 单核。
+      // 节流到 20fps:肉眼看仍然是连续转动,合成压力降一个量级。
+      const MIN_FRAME_MS = 50
+      let lastFrameTs = 0
+      const loop = (ts: number) => {
+        rafRef.current = requestAnimationFrame(loop)
+        if (ts - lastFrameTs < MIN_FRAME_MS) return
+        lastFrameTs = ts
         const now = new Date()
         const el = spinnerRef.current
         if (el) {
@@ -37,7 +45,6 @@ export default function ClockWidget({ config }: { config: ClockConfig | null }) 
           lastHmsRef.current = { h, m, s }
           setTime(now)
         }
-        rafRef.current = requestAnimationFrame(loop)
       }
       rafRef.current = requestAnimationFrame(loop)
       return () => cancelAnimationFrame(rafRef.current)

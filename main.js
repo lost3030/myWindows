@@ -214,39 +214,7 @@ async function searchStock(keyword) {
   return [];
 }
 
-async function fetchStockData(stocks) {
-  if (!stocks || stocks.length === 0) return [];
-
-  const secids = stocks.map((s) => resolveSecId(s)).join(',');
-  const url =
-    'https://push2.eastmoney.com/api/qt/ulist.np/get' +
-    `?fltt=2&fields=f2,f3,f4,f12,f14,f15,f16,f17,f18&secids=${secids}`;
-
-  try {
-    const res = await fetch(url, { headers: FETCH_HEADERS });
-    const json = await res.json();
-
-    if (json.data && json.data.diff) {
-      return json.data.diff.map((item, idx) => ({
-        code: item.f12,
-        name: item.f14 || stocks[idx]?.name || item.f12,
-        price: item.f2,
-        changePercent: item.f3,
-        changeAmount: item.f4,
-        high: item.f15,
-        low: item.f16,
-        open: item.f17,
-        prevClose: item.f18,
-        market: stocks[idx]?.market || 'unknown',
-        secid: stocks[idx]?.secid || '',
-      }));
-    }
-    return [];
-  } catch (err) {
-    console.error('Stock fetch failed:', err.message);
-    return [];
-  }
-}
+// ─── Symbol Mapping ──────────────────────────────────────────────────────────
 
 function getTencentSymbol(stock) {
   const prefixMap = { sh: 'sh', sz: 'sz', bj: 'bj', hk: 'hk', us: 'us' };
@@ -255,17 +223,236 @@ function getTencentSymbol(stock) {
   return `${prefix}${stock.code}`;
 }
 
+// 这个 app 把"非沪深港美"的品种(境外指数 / 期货 / 债券收益率)统一记成
+// market='futures',它们用的是东财自己的代码,所以换数据源时必须逐个映射。
+// 下表每一条都在 2026-08-20 实测拿到过真实报价。
+const YAHOO_FUTURES_MAP = {
+  B00Y: 'BZ=F',   // 布伦特原油
+  scm: 'CL=F',
+  aum: 'GC=F',
+  nim: 'NI=F',
+  cum: 'HG=F',
+  SPX: '^GSPC',   // 标普500
+  US30Y: '^TYX',  // 美国30年期国债收益率
+  US10Y: '^TNX',  // 美国10年期国债收益率
+  NDX: '^NDX',    // 纳斯达克100
+  DJIA: '^DJI',   // 道琼斯工业指数
+  VIX: '^VIX',    // 恐慌指数
+};
+
+// 新浪外盘接口,用来兜住 Yahoo 查不到的品种(目前只有富时中国A50)。
+const SINA_FUTURES_MAP = {
+  XIN9: 'CHA50CFD', // 富时中国A50期货
+};
+
 function getYahooSymbol(stock) {
   if (stock.market === 'us') return stock.code;
   if (stock.market === 'hk') return stock.code.padStart(4, '0') + '.HK';
   if (stock.market === 'sh') return stock.code + '.SS';
   if (stock.market === 'sz') return stock.code + '.SZ';
   if (stock.market === 'bj') return stock.code + '.BJ';
-  if (stock.market === 'futures') {
-    const map = { B00Y: 'BZ=F', scm: 'CL=F', aum: 'GC=F', nim: 'NI=F', cum: 'HG=F' };
-    return map[stock.code] || null;
-  }
+  if (stock.market === 'futures') return YAHOO_FUTURES_MAP[stock.code] || null;
   return null;
+}
+
+function getSinaSymbol(stock) {
+  if (stock.market !== 'futures') return null;
+  return SINA_FUTURES_MAP[stock.code] || null;
+}
+
+// 腾讯和新浪的接口都是 GBK 编码。数字部分是纯 ASCII,所以万一运行环境缺
+// GBK 解码能力,退回 latin1 也只是名字乱码,报价照常能解析出来。
+function decodeGbk(buf) {
+  try {
+    return new TextDecoder('gbk').decode(buf);
+  } catch {
+    return buf.toString('latin1');
+  }
+}
+
+function makeQuote(stock, fields, source) {
+  return {
+    code: stock.code,
+    name: stock.name || fields.name || stock.code,
+    price: Number(fields.price),
+    changePercent: Number(fields.changePercent) || 0,
+    changeAmount: Number(fields.changeAmount) || 0,
+    high: Number(fields.high) || 0,
+    low: Number(fields.low) || 0,
+    open: Number(fields.open) || 0,
+    prevClose: Number(fields.prevClose) || 0,
+    market: stock.market,
+    secid: stock.secid || '',
+    source,
+  };
+}
+
+// ─── Quote Source 1:东方财富(一次批量拿完所有品种)───────────────────────────
+async function fetchQuotesFromEastMoney(stocks) {
+  const byCode = new Map();
+  const secids = stocks.map((s) => resolveSecId(s)).join(',');
+  const url =
+    'https://push2.eastmoney.com/api/qt/ulist.np/get' +
+    `?fltt=2&fields=f2,f3,f4,f12,f14,f15,f16,f17,f18&secids=${secids}`;
+
+  const res = await proxyFetch(url, { headers: FETCH_HEADERS, signal: AbortSignal.timeout(6000) });
+  const json = await res.json();
+  const diff = json.data && json.data.diff;
+  if (!Array.isArray(diff)) return byCode;
+
+  // 按代码建索引,而不是按返回顺序对位:东财遇到无效 secid 会直接少返一条,
+  // 按下标对位会让后面所有品种的数据整体错位。
+  for (const item of diff) {
+    const price = Number(item.f2);
+    if (item.f12 == null || !isFinite(price) || price === 0) continue;
+    byCode.set(String(item.f12).toUpperCase(), item);
+  }
+  return byCode;
+}
+
+// ─── Quote Source 2:Yahoo Finance ───────────────────────────────────────────
+async function fetchQuoteFromYahoo(stock) {
+  const symbol = getYahooSymbol(stock);
+  if (!symbol) return null;
+
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1m&range=1d`;
+  const res = await proxyFetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    signal: AbortSignal.timeout(8000),
+  });
+  const json = await res.json();
+  const meta = json.chart && json.chart.result && json.chart.result[0] && json.chart.result[0].meta;
+  const price = meta && Number(meta.regularMarketPrice);
+  if (!meta || !isFinite(price) || price === 0) return null;
+
+  const prevRaw = meta.chartPreviousClose != null ? meta.chartPreviousClose : meta.previousClose;
+  const prevClose = Number(prevRaw) || 0;
+  const changeAmount = prevClose ? price - prevClose : 0;
+
+  return makeQuote(stock, {
+    name: meta.shortName,
+    price,
+    changePercent: prevClose ? (changeAmount / prevClose) * 100 : 0,
+    changeAmount,
+    high: meta.regularMarketDayHigh,
+    low: meta.regularMarketDayLow,
+    open: 0,
+    prevClose,
+  }, 'Yahoo');
+}
+
+// ─── Quote Source 3:腾讯 ────────────────────────────────────────────────────
+async function fetchQuoteFromTencent(stock) {
+  const symbol = getTencentSymbol(stock);
+  if (!symbol) return null;
+
+  const res = await proxyFetch(`https://qt.gtimg.cn/q=${symbol}`, { signal: AbortSignal.timeout(6000) });
+  const text = decodeGbk(Buffer.from(await res.arrayBuffer()));
+  const matched = text.match(/="([^"]*)"/);
+  if (!matched) return null;
+
+  // 字段序:1 名称 / 3 现价 / 4 昨收 / 5 今开 / 31 涨跌额 / 32 涨跌幅 / 33 最高 / 34 最低
+  const f = matched[1].split('~');
+  const price = parseFloat(f[3]);
+  if (!isFinite(price) || price === 0) return null;
+
+  return makeQuote(stock, {
+    name: f[1],
+    price,
+    changePercent: parseFloat(f[32]),
+    changeAmount: parseFloat(f[31]),
+    high: parseFloat(f[33]),
+    low: parseFloat(f[34]),
+    open: parseFloat(f[5]),
+    prevClose: parseFloat(f[4]),
+  }, '腾讯');
+}
+
+// ─── Quote Source 4:新浪外盘 ────────────────────────────────────────────────
+async function fetchQuoteFromSina(stock) {
+  const symbol = getSinaSymbol(stock);
+  if (!symbol) return null;
+
+  const res = await proxyFetch(`https://hq.sinajs.cn/list=hf_${symbol}`, {
+    headers: { Referer: 'https://finance.sina.com.cn' },
+    signal: AbortSignal.timeout(6000),
+  });
+  const text = decodeGbk(Buffer.from(await res.arrayBuffer()));
+  const matched = text.match(/="([^"]*)"/);
+  if (!matched || !matched[1]) return null;
+
+  // 字段序:0 现价 / 2 买 / 3 卖 / 4 最高 / 5 最低 / 6 时间 / 7 昨结 / 8 开盘 / 13 名称
+  const f = matched[1].split(',');
+  const price = parseFloat(f[0]);
+  if (!isFinite(price) || price === 0) return null;
+
+  const prevClose = parseFloat(f[7]) || 0;
+  const changeAmount = prevClose ? price - prevClose : 0;
+
+  return makeQuote(stock, {
+    name: f[13],
+    price,
+    changePercent: prevClose ? (changeAmount / prevClose) * 100 : 0,
+    changeAmount,
+    high: parseFloat(f[4]),
+    low: parseFloat(f[5]),
+    open: parseFloat(f[8]),
+    prevClose,
+  }, '新浪');
+}
+
+// ─── Quote 编排:东财 → Yahoo → 腾讯 → 新浪 ──────────────────────────────────
+// 先用东财批量拿一次,没拿到的品种再逐个走后面三个源,任一成功即采用,
+// 单个品种取不到不影响其它品种。2026-08-20 东财两台行情机整体不可达时,
+// 就是靠这条链把标普500 / 美30Y国债 / 布伦特 / A50 的报价兜住的。
+async function fetchStockData(stocks) {
+  if (!stocks || stocks.length === 0) return [];
+
+  const results = new Array(stocks.length).fill(null);
+
+  let emByCode = new Map();
+  try {
+    emByCode = await fetchQuotesFromEastMoney(stocks);
+  } catch (err) {
+    console.error('[quote] 东财整体失败:', err.message);
+  }
+
+  stocks.forEach((stock, idx) => {
+    const item = emByCode.get(String(stock.code).toUpperCase());
+    if (!item) return;
+    results[idx] = makeQuote(stock, {
+      name: item.f14,
+      price: item.f2,
+      changePercent: item.f3,
+      changeAmount: item.f4,
+      high: item.f15,
+      low: item.f16,
+      open: item.f17,
+      prevClose: item.f18,
+    }, '东财');
+  });
+
+  const pending = [];
+  stocks.forEach((stock, idx) => {
+    if (!results[idx]) pending.push({ stock, idx });
+  });
+
+  await Promise.all(
+    pending.map(async ({ stock, idx }) => {
+      for (const fetchFn of [fetchQuoteFromYahoo, fetchQuoteFromTencent, fetchQuoteFromSina]) {
+        try {
+          const quote = await fetchFn(stock);
+          if (quote) {
+            results[idx] = quote;
+            return;
+          }
+        } catch {}
+      }
+      console.error(`[quote] 所有数据源都失败:${stock.market}-${stock.code}`);
+    }),
+  );
+
+  return results.filter(Boolean);
 }
 
 async function fetchTrendFromTencent(stock) {
@@ -322,6 +509,51 @@ async function fetchTrendFromYahoo(stock) {
   return { prices, times, preClose };
 }
 
+async function fetchTrendFromSina(stock) {
+  const symbol = getSinaSymbol(stock);
+  if (!symbol) return null;
+
+  const url =
+    'https://stock2.finance.sina.com.cn/futures/api/jsonp.php/x/GlobalFuturesService.getGlobalFuturesMinLine' +
+    `?symbol=${symbol}`;
+  const res = await proxyFetch(url, {
+    headers: { Referer: 'https://finance.sina.com.cn' },
+    signal: AbortSignal.timeout(8000),
+  });
+  const text = await res.text();
+
+  const start = text.indexOf('x(');
+  const end = text.lastIndexOf(')');
+  if (start < 0 || end <= start) return null;
+
+  let rows;
+  try {
+    rows = JSON.parse(text.slice(start + 2, end)).minLine_1d;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(rows) || rows.length < 2) return null;
+
+  // 首行比后续行多带 日期 / 昨结 / 交易所 三个前缀字段,所以一律从尾部数:
+  // [-6]=时间 [-5]=价格 [-4]=成交量 [-3]=持仓 [-2]=均价 [-1]=完整时间。
+  const prices = [];
+  const times = [];
+  let preClose = 0;
+
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length < 6) continue;
+    if (row.length >= 10 && !preClose) preClose = parseFloat(row[1]) || 0;
+    const time = row[row.length - 6];
+    const price = parseFloat(row[row.length - 5]);
+    if (typeof time !== 'string' || !isFinite(price)) continue;
+    times.push(time);
+    prices.push(price);
+  }
+  if (prices.length < 2) return null;
+
+  return { prices, times, preClose };
+}
+
 async function fetchTrendFromEastMoney(stock) {
   const secid = resolveSecId(stock);
   const url =
@@ -369,7 +601,7 @@ async function fetchStockTrends(stocks) {
     const isAshare = ['sh', 'sz', 'bj'].includes(s.market);
     const sources = isAshare
       ? [fetchTrendFromTencent, fetchTrendFromYahoo, fetchTrendFromEastMoney]
-      : [fetchTrendFromYahoo, fetchTrendFromTencent, fetchTrendFromEastMoney];
+      : [fetchTrendFromYahoo, fetchTrendFromTencent, fetchTrendFromEastMoney, fetchTrendFromSina];
 
     for (const fn of sources) {
       try {
