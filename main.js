@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
@@ -25,6 +25,26 @@ let config;
 let tray = null;
 let settingsWindow = null;
 const widgetWindows = new Map();
+
+// ─── 置顶维持 ────────────────────────────────────────────────────────────────
+// Windows 上的"置顶"不是设一次就永久生效。别的程序会把窗口挤出置顶层,表现是
+// WS_EX_TOPMOST 标志还留着、z 序却已经掉到普通窗口下面,于是 Chrome、Claude 桌面版
+// 这类最大化窗口就把组件盖住了(2026-09-08 实测)。系统不提供"我被挤下去了"的事件,
+// 所以只能定期重新申明。单次调用就是一个 SetWindowPos,开销可以忽略。
+const KEEP_ON_TOP_INTERVAL_MS = 1000;
+let keepOnTopTimer = null;
+
+function reassertAlwaysOnTop() {
+  for (const [, win] of widgetWindows) {
+    if (win.isDestroyed() || !win.isVisible()) continue;
+    win.setAlwaysOnTop(true, 'screen-saver');
+  }
+}
+
+function startKeepOnTop() {
+  if (keepOnTopTimer) clearInterval(keepOnTopTimer);
+  keepOnTopTimer = setInterval(reassertAlwaysOnTop, KEEP_ON_TOP_INTERVAL_MS);
+}
 
 // ─── Default Configuration ───────────────────────────────────────────────────
 const DEFAULT_CONFIG = {
@@ -922,6 +942,14 @@ app.whenReady().then(() => {
   for (const widget of config.widgets) {
     createWidgetWindow(widget);
   }
+
+  startKeepOnTop();
+
+  // 这三类事件都会重排 z 序,除了定时兜底之外再各补一次,让恢复不用等下一个周期。
+  screen.on('display-added', reassertAlwaysOnTop);
+  screen.on('display-removed', reassertAlwaysOnTop);
+  screen.on('display-metrics-changed', reassertAlwaysOnTop);
+  powerMonitor.on('resume', reassertAlwaysOnTop);
 });
 
 app.on('window-all-closed', () => {
